@@ -11,16 +11,13 @@ efficient data loading during training.
 Usage:
     python extract_activations_offline.py \
         --uniref_file uniref50.fasta.gz \
-        --esm_model esm2_t12_35M_UR50D \
         --max_seq_len 1024 \
         --num_proteins 500000 \
-        --batch_size 128 \
-        --bos_vs_meanpool 1 \
-        --target_layer 11 \
-        --norm_scalars_path BOS_vs_Meanpool_norm_scalars/bos_vs_meanpool_layer11_norm_scalars.pt \
-        --output_dir offline_activations/bos_vs_meanpool_layer11 \
+        --batch_size 32 \
+        --norm_scalars_path multilayer_norm_scalars.pt \
+        --output_dir offline_activations/multilayer_crosscoder \
         --proteins_per_file 10000 \
-        --cuda_device 0
+        --cuda_devices 0
 """
 
 import os
@@ -66,26 +63,12 @@ def parse_arguments():
     # Data arguments
     parser.add_argument('--uniref_file', type=str, required=True,
                         help='Path to UniRef FASTA file (.gz)')
-    parser.add_argument('--esm_model', type=str, default="esm2_t12_35M_UR50D",
-                        choices=["esm2_t33_650M_UR50D", "esm2_t6_8M_UR50D",
-                                 "esm2_t12_35M_UR50D", "esm2_t30_150M_UR50D"],
-                        help='ESM model to use for activation extraction')
     parser.add_argument('--max_seq_len', type=int, default=1024,
                         help='Maximum sequence length')
     parser.add_argument('--num_proteins', type=int, default=500000,
                         help='Number of proteins to extract activations for')
-    parser.add_argument('--batch_size', type=int, default=128,
-                        help='Batch size for ESM processing')
-
-    # Mode selection (matching main_script_online.py)
-    parser.add_argument('--bos_vs_meanpool', type=int, default=0, choices=[0, 1],
-                        help='If 1, extract BOS token vs mean-pooled representations from a single layer')
-    parser.add_argument('--target_layer', type=int, default=None,
-                        help='Target layer for bos_vs_meanpool mode (default: last layer)')
-    parser.add_argument('--mean_pooled', type=int, default=0, choices=[0, 1],
-                        help='If 1, mean-pool activations per protein for multi-layer mode')
-    parser.add_argument('--layers_to_extract', type=int, nargs='+', default=None,
-                        help='Specific layers to extract (if None and not bos_vs_meanpool, extracts all layers)')
+    parser.add_argument('--batch_size', type=int, default=32,
+                        help='Batch size for ESM processing (reduced for multiple models)')
 
     # Normalization
     parser.add_argument('--norm_scalars_path', type=str, default=None,
@@ -102,8 +85,8 @@ def parse_arguments():
                         help='Number of proteins per output file (chunk size)')
 
     # System arguments
-    parser.add_argument('--cuda_device', type=int, default=0,
-                        help='CUDA device to use')
+    parser.add_argument('--cuda_devices', type=int, nargs='+', default=[0, 1, 2],
+                        help='CUDA devices to use for the 3 models (provide 3 device IDs)')
     parser.add_argument('--seed', type=int, default=42,
                         help='Random seed for reproducibility')
 
@@ -156,8 +139,8 @@ def load_protein_sequences(
                     last_print_time = current_time
                 
                 # Stop if we have enough sequences to sample from
-                # Collect 2x what we need for good random sampling
-                if len(valid_sequences) >= num_proteins * 2:
+                # Collect 15x what we need for good random sampling
+                if len(valid_sequences) >= num_proteins * 15:
                     print(f"\nCollected {len(valid_sequences):,} valid sequences for sampling")
                     break
     
@@ -184,6 +167,83 @@ def load_protein_sequences(
     print(f"Selected {len(selected_sequences):,} proteins for extraction")
     
     return selected_sequences, selected_metadata
+
+
+def extract_batch_activations_multimodel(
+    sequences: List[str],
+    metadata: List[str],
+    esm_models: Dict[str, tuple],  # {model_name: (model, alphabet, device)}
+    normalization_scalars: Optional[Dict] = None
+) -> Dict[str, torch.Tensor]:
+    """
+    Extract first, middle, and last layer activations from multiple ESM models.
+    Each model can be on a different GPU.
+    
+    Args:
+        sequences: List of protein sequences
+        metadata: List of sequence IDs
+        esm_models: Dict of {model_name: (esm_model, alphabet, device)}
+        normalization_scalars: Optional normalization scalars per model/layer
+        
+    Returns:
+        Dict of {model_name: tensor of shape [batch_size, 3, d_model]}
+        where the 3 layers are first, middle, last
+    """
+    batch_activations = {}
+    
+    for model_name, (esm_model, alphabet, device) in esm_models.items():
+        batch_converter = alphabet.get_batch_converter()
+        
+        # Determine first, middle, last layers
+        num_layers = esm_model.num_layers
+        first_layer = 0
+        middle_layer = num_layers // 2
+        last_layer = num_layers
+        layers = [first_layer, middle_layer, last_layer]
+        
+        # Prepare batch data for ESM
+        batch_data = [(meta, seq) for meta, seq in zip(metadata, sequences)]
+        batch_labels, batch_strs, batch_tokens = batch_converter(batch_data)
+        
+        # Forward pass through ESM on its designated GPU
+        with torch.no_grad():
+            results = esm_model(
+                batch_tokens.to(device),
+                repr_layers=layers,
+                return_contacts=False
+            )
+        
+        # Extract mean-pooled activations for each layer
+        layer_embeddings = []  # Will be [3, batch_size, d_model]
+        
+        for layer_idx in layers:
+            batch_layer_embs = []
+            
+            for seq_idx in range(len(sequences)):
+                actual_seq_len = len(sequences[seq_idx])
+                
+                # Extract tokens (excluding BOS and EOS)
+                token_emb = results["representations"][layer_idx][seq_idx, 1:actual_seq_len+1]  # [L, D]
+                meanpool_emb = token_emb.mean(dim=0)  # [D]
+                
+                # Apply normalization if scalars provided
+                if normalization_scalars is not None:
+                    if model_name in normalization_scalars:
+                        if layer_idx in normalization_scalars[model_name]:
+                            scalar = normalization_scalars[model_name][layer_idx]
+                            meanpool_emb = meanpool_emb / scalar
+                
+                batch_layer_embs.append(meanpool_emb)
+            
+            # Stack batch for this layer
+            layer_stack = torch.stack(batch_layer_embs, dim=0)  # [batch_size, D]
+            layer_embeddings.append(layer_stack)
+        
+        # Stack layers: [3, batch_size, D] -> transpose to [batch_size, 3, D]
+        model_activations = torch.stack(layer_embeddings, dim=0).transpose(0, 1)  # [batch_size, 3, D]
+        batch_activations[model_name] = model_activations
+    
+    return batch_activations
 
 
 def extract_batch_activations_bos_vs_meanpool(
@@ -324,7 +384,7 @@ def extract_batch_activations_multilayer(
 
 
 def save_chunk(
-    activations: torch.Tensor,
+    activations: Dict[str, torch.Tensor],
     metadata: List[str],
     sequences: List[str],
     chunk_idx: int,
@@ -333,7 +393,7 @@ def save_chunk(
 ):
     """Save a chunk of activations to disk."""
     chunk_data = {
-        'activations': activations.cpu(),  # [num_proteins, n_sources, d_model]
+        'activations': {k: v.cpu() for k, v in activations.items()},  # Dict of model_name: [num_proteins, 3, d_model]
         'metadata': metadata,
         'sequences': sequences,
         'chunk_idx': chunk_idx,
@@ -351,17 +411,15 @@ def main():
     args = parse_arguments()
     
     print("=" * 70)
-    print("Offline Activation Extraction for Crosscoder Training")
+    print("Multi-Model Multi-GPU Activation Extraction for Crosscoder Training")
     print("=" * 70)
     print(f"Timestamp: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}")
     print(f"UniRef file: {args.uniref_file}")
-    print(f"ESM model: {args.esm_model}")
+    print(f"ESM models: esm2_t6_8M_UR50D, esm2_t12_35M_UR50D, esm2_t30_150M_UR50D")
     print(f"Max sequence length: {args.max_seq_len}")
     print(f"Number of proteins: {args.num_proteins:,}")
     print(f"Batch size: {args.batch_size}")
-    print(f"BOS vs mean-pool mode: {bool(args.bos_vs_meanpool)}")
-    if args.bos_vs_meanpool:
-        print(f"Target layer: {args.target_layer}")
+    print(f"CUDA devices: {args.cuda_devices}")
     print(f"Output directory: {args.output_dir}")
     print(f"Proteins per file: {args.proteins_per_file:,}")
     print("=" * 70)
@@ -369,48 +427,67 @@ def main():
     # Set seeds
     set_all_seeds(args.seed)
     
-    # Setup device
-    device = torch.device(f"cuda:{args.cuda_device}" if torch.cuda.is_available() else "cpu")
-    print(f"Device: {device}")
+    # Validate GPU availability
+    if not torch.cuda.is_available():
+        print("ERROR: CUDA is not available!")
+        sys.exit(1)
+    
+    if len(args.cuda_devices) < 3:
+        print(f"ERROR: Need at least 3 GPUs for 3 models. Provided: {len(args.cuda_devices)}")
+        sys.exit(1)
+    
+    # Check all GPUs are available
+    num_gpus = torch.cuda.device_count()
+    for device_id in args.cuda_devices[:3]:
+        if device_id >= num_gpus:
+            print(f"ERROR: GPU {device_id} not available. Total GPUs: {num_gpus}")
+            sys.exit(1)
     
     # Create output directory
     output_dir = Path(args.output_dir)
     output_dir.mkdir(parents=True, exist_ok=True)
     
-    # Load ESM model
-    print(f"\nLoading ESM model: {args.esm_model}")
-    model_dict = {
-        "esm2_t33_650M_UR50D": esm.pretrained.esm2_t33_650M_UR50D,
-        "esm2_t6_8M_UR50D": esm.pretrained.esm2_t6_8M_UR50D,
-        "esm2_t12_35M_UR50D": esm.pretrained.esm2_t12_35M_UR50D,
-        "esm2_t30_150M_UR50D": esm.pretrained.esm2_t30_150M_UR50D,
-    }
-    esm_model, alphabet = model_dict[args.esm_model]()
-    esm_model = esm_model.to(device)
-    esm_model.eval()
+    # Load all three ESM models on separate GPUs
+    print(f"\nLoading ESM models across GPUs...")
+    model_configs = [
+        ("esm2_t6_8M_UR50D", esm.pretrained.esm2_t6_8M_UR50D),
+        ("esm2_t12_35M_UR50D", esm.pretrained.esm2_t12_35M_UR50D),
+        ("esm2_t30_150M_UR50D", esm.pretrained.esm2_t30_150M_UR50D),
+    ]
     
-    print(f"ESM model loaded: {esm_model.num_layers} layers, {esm_model.embed_dim} embedding dim")
+    esm_models = {}
+    model_info = {}
     
-    # Determine layers to extract
-    if args.bos_vs_meanpool:
-        target_layer = args.target_layer
-        if target_layer is None:
-            target_layer = esm_model.num_layers - 1
-        layers_to_extract = [target_layer]
-        n_sources = 2
-        print(f"\nBOS vs mean-pool mode:")
-        print(f"  Target layer: {target_layer}")
-        print(f"  Source 0: BOS token")
-        print(f"  Source 1: Mean-pooled tokens")
-    else:
-        if args.layers_to_extract is None:
-            layers_to_extract = list(range(esm_model.num_layers + 1))
-        else:
-            layers_to_extract = args.layers_to_extract
-        n_sources = len(layers_to_extract)
-        print(f"\nMulti-layer mode:")
-        print(f"  Layers: {layers_to_extract}")
-        print(f"  Mean pooled: {bool(args.mean_pooled)}")
+    for idx, (model_name, model_loader) in enumerate(model_configs):
+        device_id = args.cuda_devices[idx]
+        device = torch.device(f"cuda:{device_id}")
+        
+        print(f"  Loading {model_name} on GPU {device_id}...")
+        esm_model, alphabet = model_loader()
+        esm_model = esm_model.to(device)
+        esm_model.eval()
+        
+        # Store model, alphabet, and device
+        esm_models[model_name] = (esm_model, alphabet, device)
+        
+        # Store model info
+        num_layers = esm_model.num_layers
+        first_layer = 0
+        middle_layer = num_layers // 2
+        last_layer = num_layers
+        
+        model_info[model_name] = {
+            'num_layers': num_layers,
+            'embed_dim': esm_model.embed_dim,
+            'first_layer': first_layer,
+            'middle_layer': middle_layer,
+            'last_layer': last_layer,
+            'layers_extracted': [first_layer, middle_layer, last_layer],
+            'device': device_id
+        }
+        
+        print(f"    Layers: {num_layers}, Embed dim: {esm_model.embed_dim}")
+        print(f"    Extracting layers: {first_layer} (first), {middle_layer} (middle), {last_layer} (last)")
     
     # Load or compute normalization scalars
     normalization_scalars = None
@@ -419,19 +496,29 @@ def main():
         if norm_path.exists():
             print(f"\nLoading normalization scalars from: {args.norm_scalars_path}")
             normalization_scalars = torch.load(args.norm_scalars_path)
-            print(f"Loaded scalars: {normalization_scalars}")
+            print(f"Loaded scalars for models: {list(normalization_scalars.keys())}")
         elif args.compute_norm_scalars:
             print(f"\nComputing normalization scalars...")
-            norm_computer = LayerNormalizationComputer(
-                esm_model, alphabet, device, layers_to_extract,
-                bool(args.mean_pooled), bool(args.bos_vs_meanpool),
-                target_layer if args.bos_vs_meanpool else None
-            )
-            normalization_scalars = norm_computer.compute_normalization_scalars(
-                args.uniref_file, args.max_seq_len, args.norm_samples
-            )
+            normalization_scalars = {}
+            
+            # Compute for each model on its designated GPU
+            for model_name, (esm_model, alphabet, device) in esm_models.items():
+                print(f"  Computing for {model_name} on GPU {device.index}...")
+                layers = model_info[model_name]['layers_extracted']
+                
+                norm_computer = LayerNormalizationComputer(
+                    esm_model, alphabet, device, layers,
+                    mean_pooled=True, bos_vs_meanpool=False, target_layer=None
+                )
+                
+                model_scalars = norm_computer.compute_normalization_scalars(
+                    args.uniref_file, args.max_seq_len, args.norm_samples
+                )
+                normalization_scalars[model_name] = model_scalars
+            
             # Save the computed scalars
-            norm_computer.save_scalars(args.norm_scalars_path)
+            torch.save(normalization_scalars, args.norm_scalars_path)
+            print(f"Saved normalization scalars to: {args.norm_scalars_path}")
         else:
             print(f"Warning: Normalization scalars file not found: {args.norm_scalars_path}")
             print("Proceeding without normalization")
@@ -448,20 +535,16 @@ def main():
     
     # Configuration to save with the data
     config = {
-        'esm_model': args.esm_model,
+        'models': list(esm_models.keys()),
+        'model_info': model_info,
         'max_seq_len': args.max_seq_len,
         'num_proteins': len(sequences),
         'batch_size': args.batch_size,
-        'bos_vs_meanpool': bool(args.bos_vs_meanpool),
-        'target_layer': target_layer if args.bos_vs_meanpool else None,
-        'mean_pooled': bool(args.mean_pooled),
-        'layers_to_extract': layers_to_extract,
-        'n_sources': n_sources,
-        'd_model': esm_model.embed_dim,
         'normalization_scalars': normalization_scalars,
         'proteins_per_file': args.proteins_per_file,
         'seed': args.seed,
         'extraction_timestamp': datetime.now().isoformat(),
+        'extraction_mode': 'multimodel_first_middle_last',
     }
     
     # Save config
@@ -469,10 +552,14 @@ def main():
     # Convert tensors/non-serializable to serializable format for JSON
     config_json = config.copy()
     if config_json['normalization_scalars'] is not None:
-        config_json['normalization_scalars'] = {
-            str(k): float(v) if isinstance(v, (int, float)) else v 
-            for k, v in config_json['normalization_scalars'].items()
-        }
+        # Convert nested dict of tensors to floats
+        scalars_json = {}
+        for model_name, model_scalars in config_json['normalization_scalars'].items():
+            scalars_json[model_name] = {
+                str(layer_idx): float(scalar) if isinstance(scalar, (int, float, torch.Tensor)) else scalar
+                for layer_idx, scalar in model_scalars.items()
+            }
+        config_json['normalization_scalars'] = scalars_json
     with open(config_path, 'w') as f:
         json.dump(config_json, f, indent=2)
     print(f"\nSaved config to: {config_path}")
@@ -481,9 +568,10 @@ def main():
     torch.save(config, output_dir / "config.pt")
     
     # Extract activations in batches and save in chunks
-    print(f"\nExtracting activations...")
+    print(f"\nExtracting activations from all models...")
     
-    chunk_activations = []
+    # Initialize chunk storage as dict of lists
+    chunk_activations = {model_name: [] for model_name in esm_models.keys()}
     chunk_metadata = []
     chunk_sequences = []
     chunk_idx = 0
@@ -497,39 +585,29 @@ def main():
         batch_sequences = sequences[batch_start:batch_end]
         batch_metadata = metadata[batch_start:batch_end]
         
-        # Extract activations for this batch
-        if args.bos_vs_meanpool:
-            batch_activations = extract_batch_activations_bos_vs_meanpool(
-                batch_sequences,
-                batch_metadata,
-                esm_model,
-                alphabet,
-                device,
-                target_layer,
-                normalization_scalars
-            )
-        else:
-            batch_activations = extract_batch_activations_multilayer(
-                batch_sequences,
-                batch_metadata,
-                esm_model,
-                alphabet,
-                device,
-                layers_to_extract,
-                normalization_scalars,
-                bool(args.mean_pooled)
-            )
+        # Extract activations from all models for this batch
+        batch_activations = extract_batch_activations_multimodel(
+            batch_sequences,
+            batch_metadata,
+            esm_models,
+            normalization_scalars
+        )
         
-        # Add to current chunk
-        chunk_activations.append(batch_activations.cpu())
+        # Add to current chunk (per model)
+        for model_name, activations in batch_activations.items():
+            chunk_activations[model_name].append(activations.cpu())
+        
         chunk_metadata.extend(batch_metadata)
         chunk_sequences.extend(batch_sequences)
         total_extracted += len(batch_sequences)
         
         # Check if we should save the current chunk
         if len(chunk_metadata) >= args.proteins_per_file:
-            # Concatenate all activations in this chunk
-            combined_activations = torch.cat(chunk_activations, dim=0)
+            # Concatenate all activations in this chunk (per model)
+            combined_activations = {
+                model_name: torch.cat(acts, dim=0)
+                for model_name, acts in chunk_activations.items()
+            }
             
             # Save chunk
             filepath = save_chunk(
@@ -543,14 +621,17 @@ def main():
             print(f"\nSaved chunk {chunk_idx}: {len(chunk_metadata)} proteins -> {filepath}")
             
             # Reset for next chunk
-            chunk_activations = []
+            chunk_activations = {model_name: [] for model_name in esm_models.keys()}
             chunk_metadata = []
             chunk_sequences = []
             chunk_idx += 1
     
     # Save any remaining activations
     if len(chunk_metadata) > 0:
-        combined_activations = torch.cat(chunk_activations, dim=0)
+        combined_activations = {
+            model_name: torch.cat(acts, dim=0)
+            for model_name, acts in chunk_activations.items()
+        }
         filepath = save_chunk(
             combined_activations,
             chunk_metadata,
@@ -577,12 +658,16 @@ def main():
     print("=" * 70)
     print(f"Total proteins extracted: {total_extracted:,}")
     print(f"Number of chunks: {chunk_idx}")
-    print(f"Activation shape per protein: [{n_sources}, {esm_model.embed_dim}]")
-    print(f"Output directory: {output_dir}")
+    print(f"\nActivation shapes per protein (per model):")
+    for model_name, info in model_info.items():
+        print(f"  {model_name}: [3, {info['embed_dim']}] (first, middle, last layers)")
+    print(f"\nOutput directory: {output_dir}")
     print(f"Manifest saved to: {manifest_path}")
+    print("\nNote: For crosscoder training:")
+    print("  - Layer-specific: Use corresponding layer from each model (e.g., all 'first' layers)")
+    print("  - Concatenated: Flatten all 3 layers per model, then compare across models")
     print("=" * 70)
 
 
 if __name__ == "__main__":
     main()
-

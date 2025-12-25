@@ -1,0 +1,20 @@
+Command executed on Wed 24 Dec 2025 03:17:57 AM EST:
+Command: eval "$(conda shell.bash hook)" && conda activate mcbio2 && python NONOL_meanpool_bos_comparison_COLLECTING_FINAL_VERSIONS/CC/extract_activations_offline.py \
+    --uniref_file uniref50.fasta.gz \
+    --max_seq_len 1024 \
+    --num_proteins 1000000 \
+    --batch_size 32 \
+    --compute_norm_scalars 1 \
+    --norm_scalars_path offline_norm_scalars/multimodel_first_middle_last.pt \
+    --output_dir offline_activations/multimodel_first_middle_last \
+    --proteins_per_file 500 \
+    --seed 42 \
+    --cuda_device 0
+PID: 3553873
+-----------------
+nohup: ignoring input
+
+EnvironmentNameNotFound: Could not find conda environment: mcbio2
+You can list all discoverable environments with `conda info --envs`.
+
+
