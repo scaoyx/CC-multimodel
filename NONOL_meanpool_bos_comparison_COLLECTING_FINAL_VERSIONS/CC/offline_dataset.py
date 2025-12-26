@@ -63,13 +63,40 @@ class OfflineActivationDataset(Dataset):
         # Load config.pt for the full config with tensors
         config_pt_path = self.data_dir / "config.pt"
         if config_pt_path.exists():
-            self.full_config = torch.load(config_pt_path)
+            self.full_config = torch.load(config_pt_path, weights_only=False)
         else:
             self.full_config = self.config
         
+        # Multi-model configuration (check first as it affects other values)
+        self.is_multimodel = self.config.get('extraction_mode') == 'multimodel_first_middle_last'
+        self.model_names = self.config.get('models', [])
+        
         # Get key configuration values
-        self.n_sources = self.config['n_sources']
-        self.d_model = self.config['d_model']
+        # For multi-model: infer n_sources and d_model from model_info
+        if self.is_multimodel and 'model_info' in self.config:
+            # n_sources = number of models (each model's 3 layers will be concatenated)
+            self.n_sources = len(self.model_names)
+            
+            # d_model = max(3 * embed_dim) across all models (for padding)
+            # We need to pad to the largest dimension for architecture compatibility
+            max_embed_dim = max(info['embed_dim'] for info in self.config['model_info'].values())
+            self.d_model = 3 * max_embed_dim
+            
+            # Store individual model dimensions for proper padding
+            self.model_dims = {
+                model_name: 3 * self.config['model_info'][model_name]['embed_dim']
+                for model_name in self.model_names
+            }
+            
+            # model_groups: each source corresponds to one model [0, 1, 2]
+            self.model_groups = list(range(self.n_sources))
+        else:
+            # Standard format
+            self.n_sources = self.config['n_sources']
+            self.d_model = self.config['d_model']
+            self.model_groups = self.config.get('model_groups', None)
+            self.model_dims = None
+        
         self.bos_vs_meanpool = self.config.get('bos_vs_meanpool', False)
         self.mean_pooled = self.config.get('mean_pooled', False)
         self.layers_to_extract = self.config.get('layers_to_extract', [])
@@ -77,9 +104,22 @@ class OfflineActivationDataset(Dataset):
         print(f"Loading offline dataset from: {self.data_dir}")
         print(f"  Total proteins: {self.total_proteins:,}")
         print(f"  Number of chunks: {self.num_chunks}")
-        print(f"  n_sources: {self.n_sources}")
-        print(f"  d_model: {self.d_model}")
-        print(f"  BOS vs mean-pool mode: {self.bos_vs_meanpool}")
+        
+        if self.is_multimodel:
+            print(f"  Multi-model mode: {len(self.model_names)} models")
+            print(f"  Models: {', '.join(self.model_names)}")
+            print(f"  n_sources (after concatenation): {self.n_sources}")
+            print(f"  d_model (padded to max): {self.d_model}")
+            if self.model_dims:
+                print(f"  Individual model dimensions (before padding):")
+                for model_name, dim in self.model_dims.items():
+                    print(f"    {model_name}: {dim}")
+            if self.model_groups:
+                print(f"  Model groups: {self.model_groups}")
+        else:
+            print(f"  n_sources: {self.n_sources}")
+            print(f"  d_model: {self.d_model}")
+            print(f"  BOS vs mean-pool mode: {self.bos_vs_meanpool}")
         
         # Build index: map global index -> (chunk_idx, local_idx)
         self._build_index()
@@ -99,7 +139,7 @@ class OfflineActivationDataset(Dataset):
                 raise FileNotFoundError(f"Chunk file not found: {chunk_path}")
             
             # Load just to get the size (we could also store this in manifest)
-            chunk_data = torch.load(chunk_path)
+            chunk_data = torch.load(chunk_path, weights_only=False)
             chunk_size = chunk_data['num_proteins']
             self.chunk_sizes.append(chunk_size)
             
@@ -114,7 +154,7 @@ class OfflineActivationDataset(Dataset):
             return self._chunk_cache[chunk_idx]
         
         chunk_path = self.data_dir / f"chunk_{chunk_idx:05d}.pt"
-        chunk_data = torch.load(chunk_path)
+        chunk_data = torch.load(chunk_path, weights_only=False)
         
         # Manage cache size
         if len(self._chunk_cache) >= self._max_cached_chunks:
@@ -133,14 +173,40 @@ class OfflineActivationDataset(Dataset):
         Get a single protein's activations.
         
         Returns:
-            activations: [n_sources, d_model] tensor
+            activations: [n_sources, d_model] tensor (concatenated if multi-model)
             metadata: Optional metadata string
             sequence: Optional sequence string
         """
         chunk_idx, local_idx = self.index[idx]
         chunk_data = self._load_chunk(chunk_idx)
         
-        activations = chunk_data['activations'][local_idx]  # [n_sources, d_model]
+        # Handle multi-model dictionary format
+        # chunk_data['activations'] is {model_name: [num_proteins, 3, d_model]}
+        if isinstance(chunk_data['activations'], dict):
+            # Multi-model format: extract for this specific protein
+            activations_list = []
+            max_dim = self.d_model  # Maximum dimension after concatenation
+            
+            for model_name in self.model_names:
+                # Get this protein's activations: [3, d_model]
+                model_acts = chunk_data['activations'][model_name][local_idx]
+                # Flatten/concatenate the 3 layers: [3 * d_model]
+                concatenated = model_acts.flatten()
+                
+                # Pad to max_dim if necessary (for architecture compatibility)
+                current_dim = concatenated.shape[0]
+                if current_dim < max_dim:
+                    # Pad with zeros to match the largest model's dimension
+                    padding = torch.zeros(max_dim - current_dim, dtype=concatenated.dtype, device=concatenated.device)
+                    concatenated = torch.cat([concatenated, padding], dim=0)
+                
+                activations_list.append(concatenated)
+            
+            # Stack models as sources: [n_models, max_dim]
+            activations = torch.stack(activations_list, dim=0)
+        else:
+            # Standard format: activations is already [num_proteins, n_sources, d_model]
+            activations = chunk_data['activations'][local_idx]
         
         metadata = None
         sequence = None
@@ -224,6 +290,11 @@ class OfflineActivationDataModule(pl.LightningDataModule):
         self.n_sources = dataset.n_sources
         self.d_model = dataset.d_model
         self.full_config = dataset.full_config
+        
+        # Multi-model properties
+        self.is_multimodel = dataset.is_multimodel
+        self.model_names = dataset.model_names
+        self.model_groups = dataset.model_groups
         
         # Check if dataset is empty
         if len(dataset) == 0:

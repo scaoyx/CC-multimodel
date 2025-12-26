@@ -1,5 +1,7 @@
 offline_activations/
 offline_norm_scalars/
+wandb/
+Topk_weights/
 
 # Byte-compiled / optimized / DLL files
 __pycache__/

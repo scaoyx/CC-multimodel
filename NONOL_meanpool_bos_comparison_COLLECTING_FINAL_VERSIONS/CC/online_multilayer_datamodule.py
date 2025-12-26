@@ -209,6 +209,11 @@ class OnlineMultiLayerDataModule(pl.LightningDataModule):
         self.n_sources = None
         self.normalization_scalars = None
         
+        # Multi-model support (for consistency with offline mode)
+        self.is_multimodel = False
+        self.model_names = []
+        self.model_groups = None
+        
         # Call setup explicitly during initialization
         self.setup()
 

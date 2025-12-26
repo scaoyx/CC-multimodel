@@ -122,8 +122,8 @@ def parse_arguments():
                         help='Limit validation batches (fraction or number)')
     parser.add_argument('--active_neuron_check_interval', type=int, default=20,
                         help='Check active neurons every x batches (default: 20)')
-    parser.add_argument('--wandb_key', type=str, required=True,
-                        help='Wandb API key')
+    parser.add_argument('--wandb_key', type=str, default=None,
+                        help='Wandb API key (optional if WANDB_API_KEY env var is set)')
 
     # Mean pooling option
     parser.add_argument('--mean_pooled', type=int, default=0, choices=[0, 1],
@@ -168,7 +168,7 @@ def create_online_data_module(args, device):
     if args.resume_from_checkpoint is not None:
         # When resuming, load pre-computed scalars and disable computation
         print(f"Loading pre-computed normalization scalars from: {args.load_norm_scalars}")
-        precomputed_scalars = torch.load(args.load_norm_scalars)
+        precomputed_scalars = torch.load(args.load_norm_scalars, weights_only=False)
         print(f"Loaded scalars for layers: {list(precomputed_scalars.keys())}")
         compute_layer_norm = False
         norm_scalars_path = args.load_norm_scalars
@@ -282,6 +282,18 @@ def main():
     n_sources = data_module.n_sources
     print(f"Training {n_sources}-modal sparse autoencoder")
     
+    # Get multi-model configuration if available
+    model_groups = None
+    model_names = None
+    if hasattr(data_module, 'is_multimodel') and data_module.is_multimodel:
+        model_groups = data_module.model_groups
+        model_names = data_module.model_names
+        print(f"Multi-model crosscoder configuration:")
+        print(f"  Models: {', '.join(model_names)}")
+        print(f"  Model groups: {model_groups}")
+        print(f"  Each model has 3 concatenated layers (first, middle, last)")
+        print(f"  Per-model loss normalization: ENABLED")
+    
     if args.offline_mode:
         print(f"Using pre-extracted activations from: {args.offline_data_dir}")
         # Get mode info from offline config
@@ -298,7 +310,8 @@ def main():
     else:
         print(f"Found {n_sources} layers to use as separate input modalities")
 
-    wandb.login(key=args.wandb_key)
+    if args.wandb_key:
+        wandb.login(key=args.wandb_key)
 
     # Create run name
     mode_str = "offline" if args.offline_mode else "online"
@@ -309,7 +322,7 @@ def main():
     else:
         run_name = f"{n_sources}Modal_SAE_{mode_str}_{args.esm_model}_{random.randint(1000, 9999)}{resume_suffix}"
     
-    wandb_logger = WandbLogger(project="n-modal-sparse-autoencoder", entity="onkarproject", name=run_name)
+    wandb_logger = WandbLogger(project="CC-concatenated-multimodel", name=run_name)
 
     sample_batch = next(iter(data_module.train_dataloader()))
     
@@ -367,7 +380,18 @@ def main():
             k_aux=args.k_aux,
             encoder_decoder_scale=args.encoder_decoder_scale,
             use_xavier_init=bool(args.use_xavier_init),
+            model_groups=model_groups,
+            model_names=model_names,
         )
+        
+        print(f"Created new model with:")
+        print(f"  - Hidden dimension: {args.hidden_dim}")
+        print(f"  - Input dimensions: {args.input_dims}")
+        print(f"  - K (sparsity): {args.k}")
+        print(f"  - Learning rate: {args.learning_rate}")
+        if model_groups:
+            print(f"  - Model groups: {model_groups}")
+            print(f"  - Model names: {model_names}")
 
     start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 

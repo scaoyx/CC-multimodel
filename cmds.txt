@@ -10,7 +10,7 @@ CMD='eval "$(conda shell.bash hook)" && conda activate cc && python NONOL_meanpo
     --seed 42 \
     --cuda_device 0' && (echo "Command executed on $(date):" && echo "Command: $CMD" && echo "PID: $$" && echo "-----------------" && nohup bash -c "$CMD") > logs/nohup_offline_extraction_$(date +%Y%m%d_%H%M%S)_pid$$.out 2>&1 &
 
-
+# extract activations
 python /home/syxcao/polished_CC/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_VERSIONS/CC/extract_activations_offline.py \
     --uniref_file /home/syxcao/polished_CC/uniref50.fasta.gz \
     --max_seq_len 1024 \
@@ -22,4 +22,27 @@ python /home/syxcao/polished_CC/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_V
     --proteins_per_file 500 \
     --seed 42 \
     --cuda_devices 0 1 2
+
+# train concatenated CC
+python /home/syxcao/CC-multimodel/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_VERSIONS/CC/main_script_online.py \
+    --offline_mode 1 \
+    --hidden_dim 5000 \
+    --k 16 \
+    --encoder_decoder_init 1 \
+    --learning_rate 0.0001 \
+    --batch_size 128 \
+    --max_epochs 1000 \
+    --inactive_threshold 200 \
+    --aux_alpha 0.5 \
+    --seed 42 \
+    --num_workers 0 \
+    --val_check_interval 300 \
+    --use_xavier_init 1 \
+    --encoder_decoder_scale 1.0 \
+    --k_aux 240 \
+    --limit_val_batches 40 \
+    --offline_data_dir /home/syxcao/CC-multimodel/offline_activations
+    --cuda_device 0
+
+
 

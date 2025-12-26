@@ -59,7 +59,7 @@ class WeightTier:
 class TopKAuto(nn.Module):
     def __init__(self, input_dims, hidden_dim, k, encoder_decoder_init, 
                  inactive_threshold=200, aux_alpha=0.03125, k_aux=None,
-                 encoder_decoder_scale=None, use_xavier_init=False):
+                 encoder_decoder_scale=None, use_xavier_init=False, model_groups=None):
         """
         Multi-modal TopK Autoencoder
         
@@ -73,6 +73,8 @@ class TopKAuto(nn.Module):
             k_aux: Number of auxiliary neurons to use (default: min(hidden_dim // 2, 500))
             encoder_decoder_scale: Scaling factor for encoder weights (default: d_in / 1000)
             use_xavier_init: Whether to use Xavier initialization for decoder weights
+            model_groups: Optional list mapping each source to its model index for per-model loss normalization
+                         e.g., [0, 1, 2] for 3 sources from 3 different models
         """
         super(TopKAuto, self).__init__()
         
@@ -83,6 +85,16 @@ class TopKAuto(nn.Module):
         self.d_in = input_dims[0]  # All dimensions are the same
         self.n_sources = len(input_dims)
         self.hidden_dim = hidden_dim
+        
+        # Store model groups for per-model loss normalization
+        # model_groups maps each source index to its model index
+        # e.g., [0, 1, 2] means source 0 is from model 0, source 1 from model 1, etc.
+        if model_groups is not None:
+            self.register_buffer('model_groups', torch.tensor(model_groups, dtype=torch.long))
+            self.n_models = len(set(model_groups))
+        else:
+            self.register_buffer('model_groups', None)
+            self.n_models = self.n_sources
         
         # Initialize separate encoder weights for each source (like CrossCoder)
         self.W_enc = nn.Parameter(
@@ -191,6 +203,27 @@ class TopKAuto(nn.Module):
         for i in range(self.n_sources):
             source_loss = torch.mean((x[:, i, :] - reconstructions[:, i, :]) ** 2)
             source_losses.append(source_loss)
+        
+        # Calculate per-model losses with normalization
+        model_losses = []
+        if self.model_groups is not None and len(self.model_groups) > 0:
+            # Compute loss for each model separately, then average
+            model_mse_sum = torch.zeros(self.n_models, device=x.device)
+            model_counts = torch.zeros(self.n_models, device=x.device)
+            
+            for i in range(self.n_sources):
+                model_idx = self.model_groups[i].item()
+                source_mse = torch.mean((x[:, i, :] - reconstructions[:, i, :]) ** 2)
+                model_mse_sum[int(model_idx)] += source_mse
+                model_counts[int(model_idx)] += 1
+            
+            # Average MSE per model (normalizes for models with different numbers of sources)
+            for model_idx in range(self.n_models):
+                if model_counts[model_idx] > 0:
+                    model_loss = model_mse_sum[model_idx] / model_counts[model_idx]
+                    model_losses.append(model_loss)
+                else:
+                    model_losses.append(torch.tensor(0.0, device=x.device))
 
         aux_loss = torch.zeros((), device=x.device)
         inactive_mask = self.neuron_idle_counts > self.inactive_threshold
@@ -213,6 +246,7 @@ class TopKAuto(nn.Module):
             'main_loss': main_loss,
             'aux_loss': aux_loss,
             'source_losses': source_losses,
+            'model_losses': model_losses,
             'reconstructions': reconstructions
         }
 
@@ -240,7 +274,8 @@ class LitLit(pl.LightningModule):
     def __init__(self, input_dims, hidden_dim, k, encoder_decoder_init, 
                  learning_rate, inactive_threshold=200, aux_alpha=0.03125, 
                  active_neuron_check_interval=20, k_aux=None,
-                 encoder_decoder_scale=None, use_xavier_init=False, **kwargs):
+                 encoder_decoder_scale=None, use_xavier_init=False, 
+                 model_groups=None, model_names=None, **kwargs):
         """
         Lightning module for multi-modal TopK autoencoder
         
@@ -256,12 +291,15 @@ class LitLit(pl.LightningModule):
             k_aux: Number of auxiliary neurons to use (default: min(hidden_dim // 2, 500))
             encoder_decoder_scale: Scaling factor for encoder weights (default: d_in / 1000)
             use_xavier_init: Whether to use Xavier initialization for decoder weights
+            model_groups: Optional list mapping each source to its model index
+            model_names: Optional list of model names for logging
         """
         super().__init__()
         self.save_hyperparameters()
         
         self.hidden_dim = hidden_dim
         self.n_sources = len(input_dims)
+        self.model_names = model_names
         
         self.model = TopKAuto(
             input_dims=input_dims,
@@ -272,7 +310,8 @@ class LitLit(pl.LightningModule):
             aux_alpha=aux_alpha,
             k_aux=k_aux,
             encoder_decoder_scale=encoder_decoder_scale,
-            use_xavier_init=use_xavier_init
+            use_xavier_init=use_xavier_init,
+            model_groups=model_groups
         )
         
         self.learning_rate = learning_rate
@@ -302,6 +341,7 @@ class LitLit(pl.LightningModule):
         main_loss = outputs['main_loss']
         aux_loss = outputs['aux_loss']
         source_losses = outputs['source_losses']
+        model_losses = outputs['model_losses']
         
         total_loss = main_loss + aux_loss
         
@@ -333,6 +373,11 @@ class LitLit(pl.LightningModule):
         for i, source_loss in enumerate(source_losses):
             self.log(f'train_source_{i}_loss', source_loss, prog_bar=True, on_step=True)
         
+        # Log per-model losses (normalized)
+        for i, model_loss in enumerate(model_losses):
+            model_name = self.model_names[i] if self.model_names and i < len(self.model_names) else f'model_{i}'
+            self.log(f'train_{model_name}_loss', model_loss, prog_bar=True, on_step=True)
+        
         return total_loss
 
     def validation_step(self, batch, batch_idx):
@@ -345,6 +390,7 @@ class LitLit(pl.LightningModule):
         outputs = self(activations)
         main_loss = outputs['main_loss']
         source_losses = outputs['source_losses']
+        model_losses = outputs['model_losses']
         
         inactive_mask = self.model.neuron_idle_counts > self.model.inactive_threshold
         dead_ratio = inactive_mask.float().mean()
@@ -357,6 +403,11 @@ class LitLit(pl.LightningModule):
         # Log per-source validation losses
         for i, source_loss in enumerate(source_losses):
             self.log(f'val_source_{i}_loss', source_loss, on_step=True)
+        
+        # Log per-model validation losses (normalized)
+        for i, model_loss in enumerate(model_losses):
+            model_name = self.model_names[i] if self.model_names and i < len(self.model_names) else f'model_{i}'
+            self.log(f'val_{model_name}_loss', model_loss, on_step=True)
         
         return main_loss
 
@@ -374,7 +425,7 @@ class LitLit(pl.LightningModule):
 
     @classmethod
     def load_from_checkpoint(cls, ckpt_file, *args, **kwargs):
-        checkpoint = torch.load(ckpt_file, map_location=lambda storage, loc: storage)
+        checkpoint = torch.load(ckpt_file, map_location=lambda storage, loc: storage, weights_only=False)
         state_dict = checkpoint['state_dict']
         
         # Extract hyperparameters from checkpoint
