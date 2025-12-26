@@ -395,12 +395,17 @@ def main():
 
     start_time = datetime.now().strftime("%Y%m%d_%H%M%S")
 
+    # Create distinct checkpoint directory for concatenated model
+    checkpoint_dir = Path("CC_concatenated_checkpoints")
+    checkpoint_dir.mkdir(parents=True, exist_ok=True)
+
     checkpoint_callback = ModelCheckpoint(
         monitor='val_loss',
-        dirpath='Topk_weights',
-        filename=f'{n_sources}Modal_sae_{mode_str}_{start_time}_k{args.k}_hd{args.hidden_dim}_lr{args.learning_rate}_ep{args.max_epochs}',
+        dirpath=str(checkpoint_dir),
+        filename=f'concatenated_{n_sources}Modal_{mode_str}_{start_time}_k{args.k}_hd{args.hidden_dim}_lr{args.learning_rate}_ep{{epoch:02d}}_valloss{{val_loss:.4f}}',
         mode='min',
-        save_top_k=1,
+        save_top_k=3,
+        save_last=True,
     )
 
     checkpoint_logging_callback = CheckpointLoggingCallback(wandb_logger)

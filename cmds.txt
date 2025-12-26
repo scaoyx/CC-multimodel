@@ -41,8 +41,71 @@ python /home/syxcao/CC-multimodel/NONOL_meanpool_bos_comparison_COLLECTING_FINAL
     --encoder_decoder_scale 1.0 \
     --k_aux 240 \
     --limit_val_batches 40 \
-    --offline_data_dir /home/syxcao/CC-multimodel/offline_activations
+    --offline_data_dir /home/syxcao/CC-multimodel/offline_activations \
     --cuda_device 0
 
+# Train FIRST layer crosscoder
+python /home/syxcao/CC-multimodel/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_VERSIONS/CC/main_script_layerwise.py \
+    --layer_index 0 \
+    --hidden_dim 5000 \
+    --k 16 \
+    --encoder_decoder_init 1 \
+    --learning_rate 0.0001 \
+    --batch_size 128 \
+    --max_epochs 1000 \
+    --inactive_threshold 200 \
+    --aux_alpha 0.5 \
+    --seed 42 \
+    --num_workers 0 \
+    --val_check_interval 300 \
+    --use_xavier_init 1 \
+    --encoder_decoder_scale 1.0 \
+    --k_aux 240 \
+    --limit_val_batches 40 \
+    --offline_data_dir /home/syxcao/CC-multimodel/offline_activations \
+    --cuda_device 1
+
+
+# Train MIDDLE layer crosscoder
+python /home/syxcao/CC-multimodel/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_VERSIONS/CC/main_script_layerwise.py \
+    --layer_index 1 \
+    --hidden_dim 5000 \
+    --k 16 \
+    --encoder_decoder_init 1 \
+    --learning_rate 0.0001 \
+    --batch_size 128 \
+    --max_epochs 1000 \
+    --inactive_threshold 200 \
+    --aux_alpha 0.5 \
+    --seed 42 \
+    --num_workers 0 \
+    --val_check_interval 300 \
+    --use_xavier_init 1 \
+    --encoder_decoder_scale 1.0 \
+    --k_aux 240 \
+    --limit_val_batches 40 \
+    --offline_data_dir /home/syxcao/CC-multimodel/offline_activations \
+    --cuda_device 2
+
+# Train LAST layer crosscoder
+python /home/syxcao/CC-multimodel/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_VERSIONS/CC/main_script_layerwise.py \
+    --layer_index 2 \
+    --hidden_dim 5000 \
+    --k 16 \
+    --encoder_decoder_init 1 \
+    --learning_rate 0.0001 \
+    --batch_size 128 \
+    --max_epochs 1000 \
+    --inactive_threshold 200 \
+    --aux_alpha 0.5 \
+    --seed 42 \
+    --num_workers 0 \
+    --val_check_interval 300 \
+    --use_xavier_init 1 \
+    --encoder_decoder_scale 1.0 \
+    --k_aux 240 \
+    --limit_val_batches 40 \
+    --offline_data_dir /home/syxcao/CC-multimodel/offline_activations \
+    --cuda_device 3
 
 
