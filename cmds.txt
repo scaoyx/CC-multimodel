@@ -10,7 +10,7 @@ CMD='eval "$(conda shell.bash hook)" && conda activate cc && python NONOL_meanpo
     --seed 42 \
     --cuda_device 0' && (echo "Command executed on $(date):" && echo "Command: $CMD" && echo "PID: $$" && echo "-----------------" && nohup bash -c "$CMD") > logs/nohup_offline_extraction_$(date +%Y%m%d_%H%M%S)_pid$$.out 2>&1 &
 
-# extract activations
+# extract activations from first, middle last
 python /home/syxcao/polished_CC/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_VERSIONS/CC/extract_activations_offline.py \
     --uniref_file /home/syxcao/polished_CC/uniref50.fasta.gz \
     --max_seq_len 1024 \
@@ -22,6 +22,21 @@ python /home/syxcao/polished_CC/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_V
     --proteins_per_file 500 \
     --seed 42 \
     --cuda_devices 0 1 2
+
+
+# extract activations from second layer
+python /home/syxcao/CC-multimodel/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_VERSIONS/CC/extract_activations_layer1.py \
+    --uniref_file /home/syxcao/CC-multimodel/uniref50.fasta.gz \
+    --max_seq_len 1024 \
+    --num_proteins 1000000 \
+    --batch_size 64 \
+    --compute_norm_scalars 1 \
+    --norm_scalars_path /home/syxcao/CC-multimodel/offline_norm_scalars/multimodel_second.pt \
+    --output_dir /home/syxcao/CC-multimodel/offline_activations_second \
+    --proteins_per_file 500 \
+    --seed 42 \
+    --cuda_devices 0 1 2
+
 
 # train concatenated CC
 python /home/syxcao/CC-multimodel/NONOL_meanpool_bos_comparison_COLLECTING_FINAL_VERSIONS/CC/main_script_online.py \

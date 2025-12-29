@@ -1,9 +1,12 @@
 ##FINAL REPRODUCIBLE
 """
-Training script for layer-wise crosscoders.
+Training script for layer-specific crosscoders.
 
-Trains separate crosscoders for each layer class (first, middle, last)
-comparing the same layer type across all three ESM models.
+Trains crosscoders for a specific layer index (e.g., layer 1, layer 2, etc.)
+comparing the same layer across all three ESM models.
+
+This is different from layerwise which only supports first/middle/last.
+This script supports ANY layer index that was extracted.
 """
 import pytorch_lightning as pl
 from pytorch_lightning.loggers import WandbLogger
@@ -53,11 +56,11 @@ class CheckpointLoggingCallback(pl.Callback):
 
 
 def parse_arguments():
-    parser = argparse.ArgumentParser(description='Train layer-wise crosscoders')
+    parser = argparse.ArgumentParser(description='Train layer-specific crosscoders')
 
     # Layer selection
-    parser.add_argument('--layer_index', type=int, required=True, choices=[0, 1, 2],
-                        help='Which layer class to train on: 0=first, 1=middle, 2=last')
+    parser.add_argument('--layer_index', type=int, default=1,
+                        help='Specific layer index to train on (default: 1 = second layer)')
 
     # Data arguments
     parser.add_argument('--offline_data_dir', type=str, required=True,
@@ -120,24 +123,26 @@ def main():
     if not Path(args.offline_data_dir).exists():
         raise ValueError(f"Data directory does not exist: {args.offline_data_dir}")
     
-    layer_names = ["first", "middle", "last"]
-    layer_name = layer_names[args.layer_index]
-    
     print("=" * 70)
-    print(f"LAYER-WISE CROSSCODER TRAINING: {layer_name.upper()} LAYERS")
+    print(f"LAYER-SPECIFIC CROSSCODER TRAINING: LAYER {args.layer_index}")
+    if args.layer_index == 1:
+        print("Comparing SECOND LAYER across all three ESM models")
     print("=" * 70)
-    print(f"Layer index: {args.layer_index} ({layer_name})")
+    print(f"Layer index: {args.layer_index}")
     print(f"Data directory: {args.offline_data_dir}")
     
     set_all_seeds(args.seed)
+    
+    # Create timestamp early
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     
     device = torch.device(f"cuda:{args.cuda_device}" if torch.cuda.is_available() else "cpu")
     print(f"Device: {device}")
     
     # Create data module
-    from offline_dataset_layerwise import OfflineActivationDataModuleLayerwise
+    from offline_dataset_layer_specific import OfflineActivationDataModuleLayerSpecific
     
-    data_module = OfflineActivationDataModuleLayerwise(
+    data_module = OfflineActivationDataModuleLayerSpecific(
         data_dir=args.offline_data_dir,
         layer_index=args.layer_index,
         batch_size=args.batch_size,
@@ -153,8 +158,13 @@ def main():
     model_groups = data_module.model_groups
     model_names = data_module.model_names
     
-    print(f"\nTraining {n_sources}-model {layer_name}-layer crosscoder")
-    print(f"Models: {', '.join(model_names)}")
+    print(f"\nTraining {n_sources}-model layer-{args.layer_index} crosscoder")
+    if args.layer_index == 1:
+        print(f"Comparing second layer (index 1) across:")
+        for i, name in enumerate(model_names):
+            print(f"  - {name}: layer 1/{data_module.full_config['model_info'][name]['num_layers']} ({data_module.input_dims[i]}-dim)")
+    else:
+        print(f"Models: {', '.join(model_names)}")
     print(f"Model groups: {model_groups}")
     print(f"Per-model loss normalization: ENABLED")
     
@@ -162,16 +172,16 @@ def main():
         wandb.login(key=args.wandb_key)
 
     # Create save directory with layer-specific naming
-    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    save_dir = Path("CC_layerwise_checkpoints") / f"layer{args.layer_index}_{layer_name}" / f"run_{timestamp}"
+    save_dir = Path("CC_layer_specific_checkpoints") / f"layer{args.layer_index}" / f"run_{timestamp}"
     checkpoint_dir = save_dir / "checkpoints"
     checkpoint_dir.mkdir(parents=True, exist_ok=True)
     
     # Create run name
-    run_name = f"Layer{args.layer_index}_{layer_name}_h{args.hidden_dim}_k{args.k}_{timestamp}"
+    layer_desc = "SecondLayer" if args.layer_index == 1 else f"Layer{args.layer_index}"
+    run_name = f"{layer_desc}_3models_h{args.hidden_dim}_k{args.k}_{timestamp}"
     
     wandb_logger = WandbLogger(
-        project="CC-layerwise-multimodel",
+        project="CC-layer-specific-multimodel",
         name=run_name,
         save_dir=str(save_dir)
     )
@@ -208,12 +218,9 @@ def main():
     print(f"  - Model groups: {model_groups}")
     print(f"  - Model names: {model_names}")
     
-
-    
     # Save config
     config = {
         "layer_index": args.layer_index,
-        "layer_name": layer_name,
         "hidden_dim": args.hidden_dim,
         "k": args.k,
         "learning_rate": args.learning_rate,
@@ -221,6 +228,7 @@ def main():
         "n_sources": n_sources,
         "model_names": model_names,
         "model_groups": model_groups,
+        "input_dims": input_dims,
         "seed": args.seed,
         "timestamp": timestamp,
     }
@@ -260,7 +268,7 @@ def main():
     
     # Start training
     print("\n" + "=" * 70)
-    print(f"STARTING TRAINING: {layer_name.upper()} LAYER CROSSCODER")
+    print(f"STARTING TRAINING: LAYER {args.layer_index} CROSSCODER")
     print("=" * 70)
     
     trainer.fit(model, data_module)

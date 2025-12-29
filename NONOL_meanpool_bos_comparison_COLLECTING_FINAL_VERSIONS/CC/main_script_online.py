@@ -31,7 +31,7 @@ class CheckpointLoggingCallback(pl.Callback):
         if trainer.checkpoint_callback.best_model_path:
             self.wandb_logger.experiment.config.update({
                 "best_checkpoint_path": trainer.checkpoint_callback.best_model_path
-            })
+            }, allow_val_change=True)
 
 
 def parse_arguments():
@@ -278,9 +278,11 @@ def main():
     else:
         data_module = create_online_data_module(args, device)
     
-    # Get n_sources from data module
+    # Get n_sources and input_dims from data module
     n_sources = data_module.n_sources
+    input_dims = data_module.input_dims if hasattr(data_module, 'input_dims') else [data_module.d_model] * n_sources
     print(f"Training {n_sources}-modal sparse autoencoder")
+    print(f"Input dimensions per source: {input_dims}")
     
     # Get multi-model configuration if available
     model_groups = None
@@ -293,6 +295,7 @@ def main():
         print(f"  Model groups: {model_groups}")
         print(f"  Each model has 3 concatenated layers (first, middle, last)")
         print(f"  Per-model loss normalization: ENABLED")
+        print(f"  Variable dimensions: {list(zip(model_names, input_dims))}")
     
     if args.offline_mode:
         print(f"Using pre-extracted activations from: {args.offline_data_dir}")
@@ -352,18 +355,27 @@ def main():
             )
     else:
         # Create new model
-        # Infer input dimensions if not provided: [d_model] repeated n_sources
+        # Use input_dims from data module (accounts for variable dimensions)
         if args.input_dims is None:
-            args.input_dims = [sample_activations.shape[2]] * n_sources
-            print(f"Inferred input dimensions: {args.input_dims}")
-        elif len(args.input_dims) != n_sources:
-            raise ValueError(f"Number of input_dims ({len(args.input_dims)}) must match number of activation sources ({n_sources})")
+            # sample_activations is a list of tensors
+            model_input_dims = input_dims  # Already computed from data_module
+            print(f"Using input dimensions from data module: {model_input_dims}")
+        else:
+            model_input_dims = args.input_dims
+            if len(model_input_dims) != n_sources:
+                raise ValueError(f"Number of input_dims ({len(model_input_dims)}) must match number of activation sources ({n_sources})")
+            print(f"Using user-specified input dimensions: {model_input_dims}")
 
-        print(f"Using input dimensions: {args.input_dims}")
-        print(f"Sample batch shape: {tuple(sample_activations.shape)}")
+        # Verify sample batch structure
+        if isinstance(sample_activations, list):
+            print(f"Sample batch structure: List of {len(sample_activations)} tensors")
+            for i, tensor in enumerate(sample_activations):
+                print(f"  Source {i}: {tuple(tensor.shape)}")
+        else:
+            print(f"Sample batch shape (legacy format): {tuple(sample_activations.shape)}")
 
         model = LitLit(
-            input_dims=args.input_dims,
+            input_dims=model_input_dims,
             hidden_dim=args.hidden_dim,
             k=args.k,
             encoder_decoder_init=args.encoder_decoder_init,

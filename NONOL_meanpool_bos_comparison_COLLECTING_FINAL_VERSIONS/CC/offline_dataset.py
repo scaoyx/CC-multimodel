@@ -72,21 +72,20 @@ class OfflineActivationDataset(Dataset):
         self.model_names = self.config.get('models', [])
         
         # Get key configuration values
-        # For multi-model: infer n_sources and d_model from model_info
+        # For multi-model: infer n_sources and input_dims from model_info
         if self.is_multimodel and 'model_info' in self.config:
             # n_sources = number of models (each model's 3 layers will be concatenated)
             self.n_sources = len(self.model_names)
             
-            # d_model = max(3 * embed_dim) across all models (for padding)
-            # We need to pad to the largest dimension for architecture compatibility
-            max_embed_dim = max(info['embed_dim'] for info in self.config['model_info'].values())
-            self.d_model = 3 * max_embed_dim
-            
-            # Store individual model dimensions for proper padding
-            self.model_dims = {
-                model_name: 3 * self.config['model_info'][model_name]['embed_dim']
+            # Store individual model dimensions without padding
+            # Each source has its natural dimension: 3 * embed_dim
+            self.input_dims = [
+                3 * self.config['model_info'][model_name]['embed_dim']
                 for model_name in self.model_names
-            }
+            ]
+            
+            # For backward compatibility, store d_model as max (but won't use for padding)
+            self.d_model = max(self.input_dims)
             
             # model_groups: each source corresponds to one model [0, 1, 2]
             self.model_groups = list(range(self.n_sources))
@@ -94,8 +93,8 @@ class OfflineActivationDataset(Dataset):
             # Standard format
             self.n_sources = self.config['n_sources']
             self.d_model = self.config['d_model']
+            self.input_dims = [self.d_model] * self.n_sources  # All same dimension
             self.model_groups = self.config.get('model_groups', None)
-            self.model_dims = None
         
         self.bos_vs_meanpool = self.config.get('bos_vs_meanpool', False)
         self.mean_pooled = self.config.get('mean_pooled', False)
@@ -108,12 +107,10 @@ class OfflineActivationDataset(Dataset):
         if self.is_multimodel:
             print(f"  Multi-model mode: {len(self.model_names)} models")
             print(f"  Models: {', '.join(self.model_names)}")
-            print(f"  n_sources (after concatenation): {self.n_sources}")
-            print(f"  d_model (padded to max): {self.d_model}")
-            if self.model_dims:
-                print(f"  Individual model dimensions (before padding):")
-                for model_name, dim in self.model_dims.items():
-                    print(f"    {model_name}: {dim}")
+            print(f"  n_sources: {self.n_sources}")
+            print(f"  Input dimensions per source, no padding:  ")
+            for i, (model_name, dim) in enumerate(zip(self.model_names, self.input_dims)):
+                print(f"    Source {i} ({model_name}): {dim}")
             if self.model_groups:
                 print(f"  Model groups: {self.model_groups}")
         else:
@@ -173,7 +170,8 @@ class OfflineActivationDataset(Dataset):
         Get a single protein's activations.
         
         Returns:
-            activations: [n_sources, d_model] tensor (concatenated if multi-model)
+            activations: Tuple of tensors, one per source with natural dimensions
+                        (model_0_tensor[d0], model_1_tensor[d1], ...)
             metadata: Optional metadata string
             sequence: Optional sequence string
         """
@@ -184,29 +182,23 @@ class OfflineActivationDataset(Dataset):
         # chunk_data['activations'] is {model_name: [num_proteins, 3, d_model]}
         if isinstance(chunk_data['activations'], dict):
             # Multi-model format: extract for this specific protein
+            # Return as tuple of tensors with natural dimensions
             activations_list = []
-            max_dim = self.d_model  # Maximum dimension after concatenation
             
             for model_name in self.model_names:
                 # Get this protein's activations: [3, d_model]
                 model_acts = chunk_data['activations'][model_name][local_idx]
                 # Flatten/concatenate the 3 layers: [3 * d_model]
                 concatenated = model_acts.flatten()
-                
-                # Pad to max_dim if necessary (for architecture compatibility)
-                current_dim = concatenated.shape[0]
-                if current_dim < max_dim:
-                    # Pad with zeros to match the largest model's dimension
-                    padding = torch.zeros(max_dim - current_dim, dtype=concatenated.dtype, device=concatenated.device)
-                    concatenated = torch.cat([concatenated, padding], dim=0)
-                
                 activations_list.append(concatenated)
             
-            # Stack models as sources: [n_models, max_dim]
-            activations = torch.stack(activations_list, dim=0)
+            # Return as tuple of tensors (each with different dimension)
+            activations = tuple(activations_list)
         else:
             # Standard format: activations is already [num_proteins, n_sources, d_model]
-            activations = chunk_data['activations'][local_idx]
+            # Convert to tuple of tensors
+            acts_tensor = chunk_data['activations'][local_idx]
+            activations = tuple(acts_tensor[i] for i in range(acts_tensor.shape[0]))
         
         metadata = None
         sequence = None
@@ -289,6 +281,7 @@ class OfflineActivationDataModule(pl.LightningDataModule):
         # Store key properties
         self.n_sources = dataset.n_sources
         self.d_model = dataset.d_model
+        self.input_dims = dataset.input_dims
         self.full_config = dataset.full_config
         
         # Multi-model properties
@@ -321,34 +314,39 @@ class OfflineActivationDataModule(pl.LightningDataModule):
         print(f"Test dataset size: {len(self.test_dataset)}")
     
     @staticmethod
-    def offline_collate_fn(batch: List[Tuple]) -> Tuple[torch.Tensor, List, List]:
+    def offline_collate_fn(batch: List[Tuple]) -> Tuple[List[torch.Tensor], List, List]:
         """
-        Collate function for offline activations.
-        
-        This mimics the output format of the online collate function
-        to maintain compatibility with the training loop.
+        Collate function for offline activations with variable dimensions per source.
         
         Args:
             batch: List of (activations, metadata, sequence) tuples
+                   where activations is a tuple of tensors (one per source)
         
         Returns:
-            activations: [batch_size, n_sources, d_model] tensor
+            activations: List of [batch_size, d_i] tensors, one per source
+                        Each source can have different dimension d_i
             metadata_list: List of metadata (may be None)
             sequences_list: List of sequences (may be None)
         """
-        activations_list = []
         metadata_list = []
         sequences_list = []
         
+        # Collect activations - each batch element has tuple of source tensors
+        # We need to reorganize from [(s0, s1, s2), (s0, s1, s2), ...]
+        # to [[s0, s0, ...], [s1, s1, ...], [s2, s2, ...]]
+        n_sources = len(batch[0][0])  # Number of sources from first sample
+        source_batches = [[] for _ in range(n_sources)]
+        
         for activations, metadata, sequence in batch:
-            activations_list.append(activations)
+            for source_idx, source_tensor in enumerate(activations):
+                source_batches[source_idx].append(source_tensor)
             metadata_list.append(metadata)
             sequences_list.append(sequence)
         
-        # Stack activations
-        stacked_activations = torch.stack(activations_list, dim=0)
+        # Stack each source separately (each source can have different dimension)
+        batched_activations = [torch.stack(source_tensors, dim=0) for source_tensors in source_batches]
         
-        return stacked_activations, metadata_list, sequences_list
+        return batched_activations, metadata_list, sequences_list
     
     def train_dataloader(self) -> DataLoader:
         generator = torch.Generator().manual_seed(self.seed)

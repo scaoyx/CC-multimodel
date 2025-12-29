@@ -64,7 +64,7 @@ class TopKAuto(nn.Module):
         Multi-modal TopK Autoencoder
         
         Args:
-            input_dims: List of input dimensions for each source (e.g., [d_model, d_model, d_model])
+            input_dims: List of input dimensions for each source
             hidden_dim: Hidden dimension of the autoencoder
             k: Number of top-k activations to keep
             encoder_decoder_init: Whether to tie encoder-decoder weights
@@ -74,21 +74,15 @@ class TopKAuto(nn.Module):
             encoder_decoder_scale: Scaling factor for encoder weights (default: d_in / 1000)
             use_xavier_init: Whether to use Xavier initialization for decoder weights
             model_groups: Optional list mapping each source to its model index for per-model loss normalization
-                         e.g., [0, 1, 2] for 3 sources from 3 different models
         """
         super(TopKAuto, self).__init__()
         
-        # Verify all input dimensions are the same (like CrossCoder)
-        if len(set(input_dims)) != 1:
-            raise ValueError(f"All input dimensions must be equal for multi-modal TopK. Got: {input_dims}")
-        
-        self.d_in = input_dims[0]  # All dimensions are the same
+        # each source can have different dimension
+        self.input_dims = input_dims
         self.n_sources = len(input_dims)
         self.hidden_dim = hidden_dim
         
         # Store model groups for per-model loss normalization
-        # model_groups maps each source index to its model index
-        # e.g., [0, 1, 2] means source 0 is from model 0, source 1 from model 1, etc.
         if model_groups is not None:
             self.register_buffer('model_groups', torch.tensor(model_groups, dtype=torch.long))
             self.n_models = len(set(model_groups))
@@ -96,32 +90,43 @@ class TopKAuto(nn.Module):
             self.register_buffer('model_groups', None)
             self.n_models = self.n_sources
         
-        # Initialize separate encoder weights for each source (like CrossCoder)
-        self.W_enc = nn.Parameter(
-            torch.empty(self.n_sources, self.d_in, hidden_dim)
-        )
+        # Initialize separate encoder weights for each source with different dimensions
+        # Use ParameterList to support different sizes
+        self.W_enc = nn.ParameterList([
+            nn.Parameter(torch.empty(d_in, hidden_dim))
+            for d_in in input_dims
+        ])
         
-        # Initialize decoder weights (like CrossCoder)
-        self.W_dec = nn.Parameter(torch.empty(hidden_dim, self.n_sources, self.d_in))
-        if use_xavier_init:
-            nn.init.xavier_uniform_(self.W_dec)
-        else:
-            bound = 1.0 / (self.d_in ** 0.5)
-            self.W_dec.data.uniform_(-bound, bound)
+        # Initialize decoder weights with different dimensions per source
+        self.W_dec = nn.ParameterList([
+            nn.Parameter(torch.empty(hidden_dim, d_in))
+            for d_in in input_dims
+        ])
         
-        # Initialize encoder weights from decoder (like CrossCoder)
-        # scaling_factor = self.d_in / hidden_dim
+        # Initialize decoder weights
+        for i, d_in in enumerate(input_dims):
+            if use_xavier_init:
+                nn.init.xavier_uniform_(self.W_dec[i])
+            else:
+                bound = 1.0 / (d_in ** 0.5)
+                self.W_dec[i].data.uniform_(-bound, bound)
+        
+        # Initialize encoder weights from decoder
         if encoder_decoder_scale is not None:
             scaling_factor = encoder_decoder_scale
         else:
-            scaling_factor = self.d_in / 1000  # Fixed scaling as if hidden_dim=1000
+            scaling_factor = sum(input_dims) / len(input_dims) / 1000  # Use mean dimension
+        
         with torch.no_grad():
-            # Rearrange decoder weights to match encoder shape
-            self.W_enc.data = scaling_factor * self.W_dec.data.permute(1, 2, 0)
+            for i in range(self.n_sources):
+                self.W_enc[i].data = scaling_factor * self.W_dec[i].data.T
         
         # Bias handling like CrossCoder: shared encoder bias, per-source decoder bias
         self.b_enc = nn.Parameter(torch.zeros(hidden_dim))
-        self.b_dec = nn.Parameter(torch.zeros(self.n_sources, self.d_in))
+        self.b_dec = nn.ParameterList([
+            nn.Parameter(torch.zeros(d_in))
+            for d_in in input_dims
+        ])
 
         # Rest of initialization
         self.k = k
@@ -139,50 +144,54 @@ class TopKAuto(nn.Module):
 
     def encode(self, x):
         """
-        Encode multi-modal input
+        Encode multi-modal input with different dimensions per source
         Args:
-            x: [batch, n_sources, d_model] tensor
+            x: List of [batch, d_in_i] tensors, one per source
         Returns:
-            combined latents before sparse activation
+            combined latents before sparse activation [batch, hidden_dim]
         """
-        # Encode each source separately then sum (like CrossCoder)
-        # x: [batch, n_sources, d_model]
-        # W_enc: [n_sources, d_model, hidden_dim]
+        # x is a list: [tensor_source0, tensor_source1, ...]
+        # where tensor_source_i has shape [batch, d_in_i]
         
-        # Compute encoded representations for each source
-        encoded = torch.einsum('bsd,sdh->bh', x, self.W_enc)
+        encoded_list = []
+        for i, x_source in enumerate(x):
+            # x_source: [batch, d_in_i]
+            # W_enc[i]: [d_in_i, hidden_dim]
+            encoded = torch.matmul(x_source, self.W_enc[i])  # [batch, hidden_dim]
+            encoded_list.append(encoded)
+        
+        # Sum all encoded representations
+        combined_latents = torch.stack(encoded_list, dim=0).sum(dim=0)  # [batch, hidden_dim]
         
         # Add shared encoder bias
-        combined_latents = encoded + self.b_enc
+        combined_latents = combined_latents + self.b_enc
         
         return combined_latents
 
     def decode(self, activations):
         """
-        Decode activations to reconstruct all sources
+        Decode activations to reconstruct all sources with different dimensions per source
         Args:
             activations: [batch, hidden_dim] sparse activations
         Returns:
-            reconstructions: [batch, n_sources, d_model]
+            reconstructions: List of [batch, d_in_i] tensors
         """
-        # activations: [batch, hidden_dim]
-        # W_dec: [hidden_dim, n_sources, d_model]
-        
-        reconstructions = torch.einsum('bh,hsd->bsd', activations, self.W_dec)
-        
-        # Add per-source decoder bias
-        reconstructions = reconstructions + self.b_dec.unsqueeze(0)
+        reconstructions = []
+        for i in range(self.n_sources):
+            # activations: [batch, hidden_dim]
+            # W_dec[i]: [hidden_dim, d_in_i]
+            recon = torch.matmul(activations, self.W_dec[i])  # [batch, d_in_i]
+            recon = recon + self.b_dec[i]
+            reconstructions.append(recon)
         
         return reconstructions
 
     def forward(self, x):
         """
-        Forward pass for multi-modal input
+        Forward pass for multi-modal input with variable dimensions per source
         Args:
-            x: [batch, n_sources, d_model] tensor containing all modalities
-        """
-        batch_size = x.shape[0]
-        
+            x: List of [batch, d_in_i] tensors (one per source, no padding)
+        """        
         # Encode all sources
         combined_latents = self.encode(x)
 
@@ -193,27 +202,31 @@ class TopKAuto(nn.Module):
             self._update_neuron_activity_counts(mid_sparse)
 
         # Decode to reconstruct all sources
-        reconstructions = self.decode(mid_sparse)
+        reconstructions = self.decode(mid_sparse)  # List of tensors
 
-        # Calculate reconstruction loss for all sources
-        main_loss = torch.mean((x - reconstructions) ** 2)
+        # Calculate reconstruction loss for all sources (DIMENSION-NORMALIZED)
+        main_loss = torch.zeros((), device=x[0].device)
+        for i in range(self.n_sources):
+            # Each source contributes equally regardless of dimension
+            main_loss += torch.mean((x[i] - reconstructions[i]) ** 2)
+        main_loss = main_loss / self.n_sources
 
         # Calculate per-source losses for logging
         source_losses = []
         for i in range(self.n_sources):
-            source_loss = torch.mean((x[:, i, :] - reconstructions[:, i, :]) ** 2)
+            source_loss = torch.mean((x[i] - reconstructions[i]) ** 2)
             source_losses.append(source_loss)
         
         # Calculate per-model losses with normalization
         model_losses = []
         if self.model_groups is not None and len(self.model_groups) > 0:
             # Compute loss for each model separately, then average
-            model_mse_sum = torch.zeros(self.n_models, device=x.device)
-            model_counts = torch.zeros(self.n_models, device=x.device)
+            model_mse_sum = torch.zeros(self.n_models, device=x[0].device)
+            model_counts = torch.zeros(self.n_models, device=x[0].device)
             
             for i in range(self.n_sources):
                 model_idx = self.model_groups[i].item()
-                source_mse = torch.mean((x[:, i, :] - reconstructions[:, i, :]) ** 2)
+                source_mse = torch.mean((x[i] - reconstructions[i]) ** 2)
                 model_mse_sum[int(model_idx)] += source_mse
                 model_counts[int(model_idx)] += 1
             
@@ -223,9 +236,9 @@ class TopKAuto(nn.Module):
                     model_loss = model_mse_sum[model_idx] / model_counts[model_idx]
                     model_losses.append(model_loss)
                 else:
-                    model_losses.append(torch.tensor(0.0, device=x.device))
+                    model_losses.append(torch.tensor(0.0, device=x[0].device))
 
-        aux_loss = torch.zeros((), device=x.device)
+        aux_loss = torch.zeros((), device=x[0].device)
         inactive_mask = self.neuron_idle_counts > self.inactive_threshold
 
         if torch.count_nonzero(inactive_mask).item() != 0 and self.training:
@@ -236,10 +249,14 @@ class TopKAuto(nn.Module):
 
             scale = min(torch.count_nonzero(inactive_mask).item() / self.k_aux, 1.0)
             
-            residual = x - reconstructions
-            aux_residual = residual - aux_reconstructions
+            # Calculate residual for each source
+            aux_loss_sum = torch.zeros((), device=x[0].device)
+            for i in range(self.n_sources):
+                residual = x[i] - reconstructions[i]
+                aux_residual = residual - aux_reconstructions[i]
+                aux_loss_sum += torch.mean(aux_residual ** 2)
             
-            aux_pre_alpha = torch.mean(aux_residual ** 2)
+            aux_pre_alpha = aux_loss_sum / self.n_sources
             aux_loss = self.aux_alpha * aux_pre_alpha
 
         return {
@@ -249,7 +266,7 @@ class TopKAuto(nn.Module):
             'model_losses': model_losses,
             'reconstructions': reconstructions
         }
-
+        
     def _process_inactive_neurons(self, latents, inactive_mask):
         """Process inactive neurons for auxiliary loss"""
         masked_latents = latents.clone()
