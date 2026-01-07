@@ -146,3 +146,76 @@ python /home/syxcao/CC-multimodel/NONOL_meanpool_bos_comparison_COLLECTING_FINAL
     --cuda_device 3
 
 
+# compute family specificity with /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/crosscoder_run_compute_family_specificity.py
+python /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/crosscoder_run_compute_family_specificity.py \
+        --tsv-path /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/Correct_length_50k_random_swissprot.tsv \
+        --embeddings-path /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/Meanpooled_5k_Comp_13modal.pt \
+        --output-csv family_specific_features.csv
+(cc) syxcao@minotaur:~/CC-multimodel$ python /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/crosscoder_run_compute_family_specificity.py \
+        --tsv-path /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/Correct_length_50k_random_swissprot.tsv \
+        --embeddings-path /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/Meanpooled_5k_Comp_13modal.pt \
+        --output-csv family_specific_features.csv
+============================================================
+Crosscoder Family Specificity Analysis
+============================================================
+TSV path: /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/Correct_length_50k_random_swissprot.tsv
+Embeddings path: /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/Meanpooled_5k_Comp_13modal.pt
+Class column: Protein_families
+Output CSV: family_specific_features.csv
+============================================================
+Loading embeddings from /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/Meanpooled_5k_Comp_13modal.pt
+Embeddings shape: torch.Size([50000, 5000])
+Number of proteins: 50000
+Embedding dimension: 5000
+Processing info: {'checkpoint_path': '/data/cb/scratch/onkar/viral-mutation/Topk_weights/13Modal_sae_online_esm2_t12_35M_UR50D_20251001_164542_k16_hd5000_lr0.0001_ep1000.ckpt', 'esm_model': 'esm2_t12_35M_UR50D', 'layers_extracted': [0, 1, 2, 3, 4, 5, 6, 7, 8, 9, 10, 11, 12], 'max_seq_len': 1024, 'use_layer_norm': True, 'pooling_method': 'max', 'hidden_dim': 5000, 'n_proteins_processed': 50000, 'timestamp': '2025-10-29T22:27:18.152992'}
+Loading TSV from /afs/csail.mit.edu/u/s/syxcao/CC-multimodel/val_family/Correct_length_50k_random_swissprot.tsv
+TSV columns: ['Entry', 'Reviewed', 'Entry Name', 'Protein names', 'Gene Names', 'Organism', 'Length', 'Gene Ontology IDs', 'Gene Ontology (biological process)', 'Gene Ontology (cellular component)', 'Gene Ontology (molecular function)', 'Sequence', 'Gene Ontology (GO)', 'Protein families', 'Motif', 'EC number', 'Function [CC]', 'Organism (ID)', 'Gene Names (synonym)', 'Sequence similarities', 'Zinc finger', 'Region', 'Repeat', 'Compositional bias', 'Domain [CC]', 'Domain [FT]', 'Intramembrane', 'Subcellular location [CC]', 'Topological domain', 'Transmembrane', 'Involvement in disease', 'Pharmaceutical use', 'PubMed ID', 'DOI ID', 'Helix', 'Turn', 'Beta strand', '3D', 'Absorption', 'Active site', 'Binding site', 'Catalytic activity', 'Cofactor', 'DNA binding', 'pH dependence', 'Pathway', 'Kinetics', 'Activity regulation', 'Redox potential', 'Rhea ID', 'Site', 'Temperature dependence']
+Number of sequences in embeddings: 50000
+Number of proteins with family annotations: 45212
+
+Activations shape: (5000, 45212)
+Total dimensions: 5000
+Total proteins (with families): 45212
+Processing dimensions: 100%|██████████████████████████████████████████████████| 5000/5000 [02:38<00:00, 31.61it/s]
+
+Saving results to family_specific_features.csv
+Saved 1403 family-specificity results
+
+============================================================
+Summary Statistics
+============================================================
+Total dimension-family pairs analyzed: 1403
+Unique dimensions with family specificity: 1401
+Unique families found: 794
+
+Top 10 families by frequency:
+class
+Frog skin active peptide (FSAP) family, Tryptophillin subfamily    19
+Bradykinin-potentiating peptide family                             14
+Protamine P1 family                                                12
+Pyrokinin family                                                    9
+Formicidae venom precursor-01 superfamily                           8
+Conotoxin M superfamily                                             8
+Krueppel C2H2-type zinc-finger protein family                       8
+Mycobacterial PE family, PGRS subfamily                             8
+RNA polymerase subunit omega family                                 7
+G-protein coupled receptor 1 family                                 7
+
+Mean F1 score: 0.4053
+Mean precision: 0.4146
+Mean recall: 0.6289
+Mean ROC AUC: 0.7376
+
+Top 10 dimension-family pairs by F1 score:
+ dim                                                                           class  f1  precision  recall  n_data_points
+  13                                                Deoxyhypusine hydroxylase family 1.0        1.0     1.0              6
+  30                                                          PMP-22/EMP/MP20 family 1.0        1.0     1.0              6
+  58                                         Mycobacterial PE family, PGRS subfamily 1.0        1.0     1.0              5
+  64                                                          IPP transferase family 1.0        1.0     1.0             78
+  85                 CN hydrolase family, Apolipoprotein N-acyltransferase subfamily 1.0        1.0     1.0              5
+  86 Binding-protein-dependent transport system permease family, AraH/RbsC subfamily 1.0        1.0     1.0              8
+  87                                                                     ArgR family 1.0        1.0     1.0             24
+  92                                                                     PhoU family 1.0        1.0     1.0              5
+ 107                                                                      Fur family 1.0        1.0     1.0              8
+ 133                                                Thr operon leader peptide family 1.0        1.0     1.0              6
+

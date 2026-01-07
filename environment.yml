@@ -71,4 +71,4 @@ dependencies:
       - torchvision==0.24.1
       - triton==3.5.1
       - typing-extensions==4.15.0
-prefix: /mnt/home/syxcao/conda/envs/cc
+# prefix: /mnt/home/syxcao/conda/envs/cc
